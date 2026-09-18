@@ -1,20 +1,29 @@
 """
-TAKEDOWN AI - Backend Server (Render.com 상시 구동용)
---------------------------------------------------
-- google-genai 최신 라이브러리 사용 (새 형식 API 키 대응)
-- 503(서버 혼잡) 자동 재시도 로직 포함
-- ngrok 없음: Render.com이 자체 도메인을 줍니다
+TAKEDOWN AI - Backend Server (안전한 "직접 업로드" 방식)
+--------------------------------------------------------
+핵심 아이디어:
+1. 아이패드가 서버에 "업로드하고 싶어"라고만 요청 (영상은 아직 안 보냄)
+2. 서버가 Gemini에 "재개 가능한 업로드 URL"을 요청해서 받음
+   -> 이 임시 URL에는 API 키가 필요 없어서, 아이패드에 그대로 넘겨줘도 안전함
+3. 아이패드가 그 임시 URL로 영상을 "직접" Gemini에 업로드
+   -> 우리 서버(Render)는 영상 자체를 한 바이트도 안 받기 때문에 메모리 문제가 없음!
+4. 업로드가 끝나면 아이패드가 서버에 "분석해줘"라고 요청 (영상의 Gemini 파일 이름만 보냄, 아주 작은 텍스트)
+5. 서버가 그 파일을 Gemini에게 분석시키고, 결과 JSON을 아이패드에 돌려줌
+
+이 구조는 API 키가 절대 브라우저(index.html)에 노출되지 않으면서도,
+Render 무료 플랜(메모리 512MB)에서도 큰 영상을 처리할 수 있게 해줍니다.
 """
 
 import os
 import json
 import re
-import tempfile
 import time
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
@@ -62,7 +71,7 @@ score는 0~100 사이의 정수여야 한다. 반드시 위 4개 키(score, good
 """
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "300"))
-ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-m4v", "video/webm"}
+GEMINI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 
 
 def extract_json(text: str) -> dict:
@@ -80,43 +89,70 @@ def health_check():
     return {"status": "ok", "message": "TAKEDOWN AI 백엔드가 정상 작동 중입니다."}
 
 
-@app.post("/api/analyze")
-async def analyze_video(video: UploadFile = File(...)):
-    if video.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"지원하지 않는 파일 형식입니다: {video.content_type}. mp4/mov/webm만 업로드해주세요."
-        )
+# ---------------------------------------------------------
+# 1단계 API: 아이패드가 "업로드하고 싶다"고 요청하면,
+# 서버가 대신 Gemini에게 임시 업로드 주소를 받아서 돌려줍니다.
+# 이 임시 주소에는 API 키가 필요 없어서, 그대로 브라우저에 넘겨도 안전합니다.
+# ---------------------------------------------------------
+class StartUploadRequest(BaseModel):
+    file_size: int
+    mime_type: str
 
-    contents = await video.read()
-    size_mb = len(contents) / (1024 * 1024)
+
+@app.post("/api/start-upload")
+def start_upload(req: StartUploadRequest):
+    size_mb = req.file_size / (1024 * 1024)
     if size_mb > MAX_UPLOAD_MB:
-        raise HTTPException(
-            status_code=400,
-            detail=f"파일이 너무 큽니다 ({size_mb:.1f}MB). {MAX_UPLOAD_MB}MB 이하로 업로드해주세요."
-        )
+        raise HTTPException(status_code=400, detail=f"파일이 너무 큽니다 ({size_mb:.1f}MB). {MAX_UPLOAD_MB}MB 이하로 업로드해주세요.")
 
-    suffix = os.path.splitext(video.filename or "")[1] or ".mp4"
-    tmp_path = None
-    uploaded_file = None
+    resp = requests.post(
+        GEMINI_UPLOAD_BASE,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(req.file_size),
+            "X-Goog-Upload-Header-Content-Type": req.mime_type,
+            "Content-Type": "application/json",
+        },
+        json={"file": {"display_name": "wrestling_video"}},
+        timeout=30,
+    )
 
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Gemini 업로드 준비 중 오류: {resp.text}")
+
+    upload_url = resp.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise HTTPException(status_code=502, detail="Gemini로부터 업로드 주소를 받지 못했습니다.")
+
+    # 이 upload_url은 이번 업로드 한 번에만 쓸 수 있는 임시 주소라서 안전합니다 (API 키 불필요).
+    return {"upload_url": upload_url}
+
+
+# ---------------------------------------------------------
+# 2단계 API: 아이패드가 위에서 받은 upload_url로 영상을 "직접" Gemini에 업로드한 뒤,
+# 그 결과로 받은 file_uri/file_name을 여기로 보내서 "분석해줘"라고 요청합니다.
+# 이 단계에서는 아주 작은 텍스트(파일 이름)만 오가기 때문에 서버 메모리 부담이 없습니다.
+# ---------------------------------------------------------
+class AnalyzeRequest(BaseModel):
+    file_name: str  # 예: "files/abc123"
+
+
+@app.post("/api/analyze")
+def analyze_video(req: AnalyzeRequest):
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(contents)
-            tmp_path = tmp.name
-
-        uploaded_file = client.files.upload(file=tmp_path)
+        uploaded_file = client.files.get(name=req.file_name)
 
         wait_seconds = 0
         while uploaded_file.state.name == "PROCESSING" and wait_seconds < 120:
             time.sleep(2)
             wait_seconds += 2
-            uploaded_file = client.files.get(name=uploaded_file.name)
+            uploaded_file = client.files.get(name=req.file_name)
 
         if uploaded_file.state.name == "FAILED":
             raise HTTPException(status_code=502, detail="Gemini 서버에서 영상 처리에 실패했습니다.")
 
-        # ---- 503(혼잡) 자동 재시도 로직 ----
         response = None
         for attempt in range(3):
             try:
@@ -154,13 +190,10 @@ async def analyze_video(video: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"서버 오류: {str(e)}")
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        if uploaded_file:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+        try:
+            client.files.delete(name=req.file_name)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
